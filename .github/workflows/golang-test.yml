@@ -1,5 +1,12 @@
-name: GoCI
-on: [push, pull_request]
+name: golang-test
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - development
+      - v*
+  pull_request:
 jobs:
   build:
     name: Test

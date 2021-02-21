@@ -14,6 +14,8 @@ import (
 func emptyFunc(context.Context) {}
 
 func TestWorkerPool_OptionCapacity(t *testing.T) {
+	t.Parallel()
+
 	f := func(context.Context) { time.Sleep(10 * time.Millisecond) }
 	{
 		pool := New(Options{Capacity: 1})
@@ -42,6 +44,8 @@ func TestWorkerPool_OptionCapacity(t *testing.T) {
 }
 
 func TestWorkerPool_OptionIdleTimeout(t *testing.T) {
+	t.Parallel()
+
 	pool := New(Options{Capacity: 3, IdleTimeout: 200 * time.Millisecond})
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -58,6 +62,8 @@ func TestWorkerPool_OptionIdleTimeout(t *testing.T) {
 }
 
 func TestWorkerPool_OptionWaitIfNoWorkersAvailable(t *testing.T) {
+	t.Parallel()
+
 	testF := func(capacity uint32, gof func(pool *WorkerPool), uselessCreate bool) {
 		pool := New(Options{
 			Capacity:                   capacity,
@@ -98,6 +104,8 @@ func TestWorkerPool_OptionWaitIfNoWorkersAvailable(t *testing.T) {
 }
 
 func TestWorkerPool_OptionCreateIfNoWorkersAvailable(t *testing.T) {
+	t.Parallel()
+
 	testF := func(capacity uint32, gof func(pool *WorkerPool)) {
 		pool := New(Options{
 			Capacity:                   capacity,
@@ -128,6 +136,8 @@ func TestWorkerPool_OptionCreateIfNoWorkersAvailable(t *testing.T) {
 }
 
 func TestWorkerPool_OptionCreateWorkerID(t *testing.T) {
+	t.Parallel()
+
 	pool := New(Options{
 		Capacity:                 3,
 		IdleTimeout:              300 * time.Millisecond,
@@ -157,6 +167,8 @@ func TestWorkerPool_OptionCreateWorkerID(t *testing.T) {
 }
 
 func TestWorkerPool_Concurrent(t *testing.T) {
+	t.Parallel()
+
 	testF := func(_ *testing.T, opts Options, submitF func(ctx context.Context, pool *WorkerPool, f Func)) {
 		pool := New(opts)
 		wg := sync.WaitGroup{}
@@ -183,6 +195,8 @@ func TestWorkerPool_Concurrent(t *testing.T) {
 	}
 
 	t.Run("NoOptions", func(t *testing.T) {
+		t.Parallel()
+
 		testF(t, Options{
 			Capacity:    20,
 			IdleTimeout: 55 * time.Millisecond,
@@ -196,7 +210,10 @@ func TestWorkerPool_Concurrent(t *testing.T) {
 			pool.SubmitConcurrentDependent(ctx, f)
 		})
 	})
+
 	t.Run("WaitIfNoWorkersAvailable", func(t *testing.T) {
+		t.Parallel()
+
 		testF(t, Options{
 			Capacity:                 66,
 			IdleTimeout:              55 * time.Millisecond,
@@ -214,7 +231,10 @@ func TestWorkerPool_Concurrent(t *testing.T) {
 			pool.SubmitConcurrentDependent(ctx, f)
 		})
 	})
+
 	t.Run("CreateIfNoWorkersAvailable", func(t *testing.T) {
+		t.Parallel()
+
 		testF(t, Options{
 			Capacity:                   20,
 			IdleTimeout:                55 * time.Millisecond,
