@@ -1,4 +1,4 @@
-// Package workerpool provides a very flexible implementation of worker(goroutine) pool.
+// Package workerpool provides a flexible implementation of worker(goroutine) pool.
 //
 // It is extremely useful when we facing "morestack" issue.
 // Also some options can enable us to do lockless operations under some circumstances
@@ -37,7 +37,7 @@ type Options struct {
 	CreateIfNoWorkersAvailable bool
 	// CreateWorkerID will inject a worker id into the context of Func.
 	// The worker id is useful, for example, we can use it to do some lockless operations
-	// when we have fixed number of workers and those workers live long enough.
+	// under some circumstances when we have fixed number of workers and those workers live long enough.
 	CreateWorkerID bool
 }
 
@@ -87,7 +87,7 @@ type WorkerPool struct {
 }
 
 // New creates a new WorkerPool.
-// The pool with default Options has infinite workers and the workers never die.
+// The pool with default(empty) Options has infinite workers and the workers never die.
 func New(opts Options) *WorkerPool {
 	var idpool *idpool
 	if opts.CreateWorkerID {
@@ -124,9 +124,13 @@ func New(opts Options) *WorkerPool {
 
 // Stats contains a list of worker counters.
 type Stats struct {
-	ResidentWorkers  uint32
+	// ResidentWorkers counts the number of resident workers.
+	ResidentWorkers uint32
+	// EphemeralWorkers counts the number of ephemeral workers when
+	// the option CreateIfNoWorkersAvailable is enabled.
 	EphemeralWorkers uint32
-	IdleWorkers      uint32
+	// IdleWorkers counts all idle workers including any newly created workers.
+	IdleWorkers uint32
 }
 
 // Stats returns the current stats.
@@ -140,6 +144,7 @@ func (p *WorkerPool) Stats() Stats {
 
 // WaitDone waits until all tasks done or the context done.
 // The pool becomes unusable(read only) after this operation.
+// If you want to wait multiple times, using an extra sync.WaitGroup.
 func (p *WorkerPool) WaitDone(ctx context.Context) error {
 	if !atomic.CompareAndSwapInt32(&p.stopped, 0, 1) {
 		return nil
@@ -160,14 +165,14 @@ func (p *WorkerPool) WaitDone(ctx context.Context) error {
 	}
 }
 
-// Submit submits a task and wait until it acquired by an available worker
+// Submit submits a task and waits until it acquired by an available worker
 // or wait until the context done if WaitIfNoWorkersAvailable enabled.
 // The "same" ctx will be passed into Func.
 func (p *WorkerPool) Submit(ctx context.Context, fn Func) error {
 	return p.submit(ctx, task{ctx: ctx, fn: fn})
 }
 
-// SubmitConcurrentDependent submits multiple concurrent dependent tasks and wait until
+// SubmitConcurrentDependent submits multiple *concurrent dependent* tasks and waits until
 // all of them are acquired by available workers or wait until the
 // context done if WaitIfNoWorkersAvailable enabled.
 // The "same" ctx will be passed into Func.
@@ -203,8 +208,8 @@ func (p *WorkerPool) SubmitConcurrentDependent(ctx context.Context, fns ...Func)
 		}
 	}
 
-	// We can not reuse futureTask.taskc here since there is a rare chance that
-	// the stale futureTask may get notified.
+	// We can not reuse futureTask.funcc here since there is a rare chance that
+	// the stale futureTask may get notified by the reused channel with newest event.
 	settled = true
 	for i, fn := range fns {
 		// Dead lock is impossible here since all tasks has already took a placeholder,
@@ -286,7 +291,7 @@ func (p *WorkerPool) asyncWork(ephemeral bool, initTask task) {
 			if ephemeral {
 				atomic.AddUint32(&p.nephemerals, ^uint32(0))
 			} else {
-				atomic.AddUint32(&p.nworkers, ^uint32(0)) // Subtract 1.
+				atomic.AddUint32(&p.nworkers, ^uint32(0))
 			}
 
 			p.recycleWorker(worker)
