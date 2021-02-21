@@ -216,7 +216,8 @@ func (p *WorkerPool) SubmitConcurrentDependent(ctx context.Context, fns ...Func)
 	return nil
 }
 
-func (p *WorkerPool) submit(ctx context.Context, task task) error { // Extra per task options??
+// Extra per task options??
+func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:gocyclo
 	if atomic.LoadInt32(&p.stopped) == 1 {
 		return ErrInvalidWorkerPool
 	}
@@ -398,10 +399,6 @@ func (t task) execute(inject func(context.Context) context.Context) {
 type futureTask struct {
 	cancelc chan struct{}
 	funcc   chan Func
-}
-
-func newFutureTask() futureTask {
-	return newFutureTaskFrom(make(chan Func))
 }
 
 func newFutureTaskFrom(fnc chan Func) futureTask {
