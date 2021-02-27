@@ -8,6 +8,7 @@ package workerpool
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,17 +24,22 @@ var (
 
 // Options configurates the WorkerPool.
 type Options struct {
-	// Capacity specifies the maximum number of running workers(goroutines), 0 means no limit.
+	// Capacity specifies the maximum number of resident running workers(goroutines),
+	// 0 means no limit.
 	Capacity uint32
 	// IdleTimeout is the maximum amount of time an idle worker(goroutine) will
 	// remain idle before terminating itself. Zero means no limit, the workers
 	// never die if the pool is valid.
 	IdleTimeout time.Duration
-	// WaitIfNoWorkersAvailable will wait until there is a worker available if all workers are busy.
-	// This option may will conflict with CreateIfNoWorkersAvailable.
+	// WaitIfNoWorkersAvailable will wait until there is a worker available
+	// if all resident workers are busy.
+	// It only works if the option Capacity greater than zero.
+	// This option will conflict with CreateIfNoWorkersAvailable.
 	WaitIfNoWorkersAvailable bool
-	// CreateIfNoWorkersAvailable will create a ephemeral worker only if all workers are busy
-	// and the option WaitIfNoWorkerAvailable is disabled.
+	// CreateIfNoWorkersAvailable will create an ephemeral worker only
+	// if all resident workers are busy.
+	// It only works if the option Capacity greater than zero and the option
+	// WaitIfNoWorkerAvailable is disabled.
 	CreateIfNoWorkersAvailable bool
 	// CreateWorkerID will inject a worker id into the context of Func.
 	// The worker id is useful, for example, we can use it to do some lockless operations
@@ -73,10 +79,12 @@ type WorkerPool struct {
 	waitIfNoWorkersAvailable   bool
 	createIfNoWorkersAvailable bool
 	idpool                     *idpool
+	workerCapacity             capacityNotifier
 
 	nworkers    uint32
 	nephemerals uint32
 	nidles      uint32
+	nwaiters    uint32
 
 	taskc   chan task
 	stopc   chan struct{}
@@ -93,6 +101,11 @@ func New(opts Options) *WorkerPool {
 	if opts.CreateWorkerID {
 		idpool = newIDPool()
 	}
+	stopc := make(chan struct{})
+	workerCapacity := capacityNotifier{}
+	if opts.Capacity > 0 && opts.IdleTimeout > 0 && opts.WaitIfNoWorkersAvailable {
+		(&workerCapacity).enable(stopc, int(opts.Capacity))
+	}
 
 	return &WorkerPool{
 		capacity:                   opts.Capacity,
@@ -100,13 +113,14 @@ func New(opts Options) *WorkerPool {
 		waitIfNoWorkersAvailable:   opts.WaitIfNoWorkersAvailable,
 		createIfNoWorkersAvailable: opts.CreateIfNoWorkersAvailable,
 		idpool:                     idpool,
+		workerCapacity:             workerCapacity,
 
 		nworkers:    0,
 		nephemerals: 0,
 		nidles:      0,
 
 		taskc:   make(chan task),
-		stopc:   make(chan struct{}),
+		stopc:   stopc,
 		stopped: 0,
 		wg:      sync.WaitGroup{},
 		factory: sync.Pool{
@@ -131,6 +145,8 @@ type Stats struct {
 	EphemeralWorkers uint32
 	// IdleWorkers counts all idle workers including any newly created workers.
 	IdleWorkers uint32
+	// PendingSubmits counts all pending Submit(*).
+	PendingSubmits uint32
 }
 
 // Stats returns the current stats.
@@ -139,6 +155,7 @@ func (p *WorkerPool) Stats() Stats {
 		ResidentWorkers:  atomic.LoadUint32(&p.nworkers),
 		EphemeralWorkers: atomic.LoadUint32(&p.nephemerals),
 		IdleWorkers:      atomic.LoadUint32(&p.nidles),
+		PendingSubmits:   atomic.LoadUint32(&p.nwaiters),
 	}
 }
 
@@ -226,6 +243,8 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 	if atomic.LoadInt32(&p.stopped) == 1 {
 		return ErrInvalidWorkerPool
 	}
+	atomic.AddUint32(&p.nwaiters, 1)
+	defer atomic.AddUint32(&p.nwaiters, ^uint32(0))
 
 	select {
 	case <-p.stopc:
@@ -257,6 +276,8 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 				return ctx.Err()
 			case p.taskc <- task:
 				return nil
+			case <-p.workerCapacity.availabled():
+				// Try to create a worker.
 			}
 		} else {
 			select {
@@ -278,24 +299,29 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 }
 
 func (p *WorkerPool) asyncWork(ephemeral bool, initTask task) {
-	worker := p.makeWorker()
-
 	p.wg.Add(1)
+	if ephemeral {
+		atomic.AddUint32(&p.nephemerals, 1)
+	} else {
+		p.workerCapacity.decr()
+	}
+	atomic.AddUint32(&p.nidles, 1)
+
+	worker := p.makeWorker()
 	go func() {
-		atomic.AddUint32(&p.nidles, 1)
-		if ephemeral {
-			atomic.AddUint32(&p.nephemerals, 1)
-		}
 		defer func() {
-			atomic.AddUint32(&p.nidles, ^uint32(0))
+			p.recycleWorker(worker)
+			p.wg.Done()
+
 			if ephemeral {
 				atomic.AddUint32(&p.nephemerals, ^uint32(0))
 			} else {
-				atomic.AddUint32(&p.nworkers, ^uint32(0))
+				if nworkers := atomic.AddUint32(&p.nworkers, ^uint32(0)); nworkers == ^uint32(0) {
+					panic("the counter of resident worker less than 0")
+				}
+				p.workerCapacity.incr()
 			}
-
-			p.recycleWorker(worker)
-			p.wg.Done()
+			atomic.AddUint32(&p.nidles, ^uint32(0))
 		}()
 
 		worker.run(&p.nidles, ephemeral, initTask)
@@ -344,8 +370,9 @@ func (w *worker) run(idleCounter *uint32, ephemeral bool, initTask task) {
 	}()
 
 	var (
-		timerc   <-chan time.Time
-		nexttask = initTask
+		timerc       <-chan time.Time
+		timerunknown = true
+		nexttask     = initTask
 	)
 	for {
 		atomic.AddUint32(idleCounter, ^uint32(0))
@@ -367,13 +394,13 @@ func (w *worker) run(idleCounter *uint32, ephemeral bool, initTask task) {
 				timer = time.NewTimer(w.idleTimeout)
 			} else {
 				// Careful, this piece of code may cause problems!!!
-				// Ref: https://github.com/golang/go/issues/11513
 				// We have not drained the t.C, so this is ok.
-				if !timer.Stop() {
+				if !timerunknown && !timer.Stop() {
 					<-timer.C
 				}
 				timer.Reset(w.idleTimeout)
 			}
+			timerunknown = false
 			timerc = timer.C
 		}
 
@@ -471,4 +498,75 @@ func (p *idpool) put(id uint32) {
 	} else {
 		p.recycled[id] = true
 	}
+}
+
+type capacityNotifier struct {
+	enabled bool
+
+	countc  chan int
+	notifyc chan struct{}
+	stopc   <-chan struct{}
+}
+
+func (n *capacityNotifier) enable(stopc <-chan struct{}, capacity int) {
+	if n.enabled {
+		panic("enabled")
+	}
+	n.enabled = true
+	n.countc = make(chan int)
+	n.notifyc = make(chan struct{})
+	n.stopc = stopc
+	go n.countAndNotifyLoop(capacity)
+}
+
+func (n capacityNotifier) countAndNotifyLoop(max int) {
+	remain := max
+	notifyc := n.notifyc //nolint:ineffassign,staticcheck
+	for {
+		if remain > max || remain < 0 {
+			panic(fmt.Sprintf("invalid %d not in [0, %d]", remain, max))
+		}
+		if remain == 0 {
+			notifyc = nil
+		} else {
+			notifyc = n.notifyc
+		}
+
+		select {
+		case <-n.stopc:
+			return
+		case v := <-n.countc:
+			remain += v
+		case notifyc <- struct{}{}:
+			// Sleep here??
+			runtime.Gosched()
+		}
+	}
+}
+
+func (n capacityNotifier) incr() {
+	if !n.enabled {
+		return
+	}
+	select {
+	case <-n.stopc:
+	case n.countc <- 1:
+	}
+}
+
+func (n capacityNotifier) decr() {
+	if !n.enabled {
+		return
+	}
+	select {
+	case <-n.stopc:
+	case n.countc <- -1:
+	}
+}
+
+func (n capacityNotifier) availabled() <-chan struct{} {
+	if !n.enabled {
+		return nil
+	}
+	return n.notifyc
 }

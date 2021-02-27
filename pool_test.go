@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,8 +56,28 @@ func TestWorkerPool_OptionIdleTimeout(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	stats := pool.Stats()
 	require.Equal(t, uint32(3), stats.ResidentWorkers)
-	time.Sleep(300 * time.Millisecond)
-	stats = pool.Stats()
+
+	stopc := make(chan struct{})
+	donec := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopc:
+				return
+			case <-time.After(time.Millisecond):
+			}
+			stats = pool.Stats()
+			if stats.ResidentWorkers == 0 {
+				close(donec)
+				return
+			}
+		}
+	}()
+	select {
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("timed out to waiting idle workers")
+	case <-donec:
+	}
 	require.Equal(t, uint32(0), stats.ResidentWorkers)
 	require.Nil(t, pool.WaitDone(context.TODO()))
 }
@@ -71,6 +92,31 @@ func TestWorkerPool_OptionWaitIfNoWorkersAvailable(t *testing.T) {
 			WaitIfNoWorkersAvailable:   true,
 			CreateIfNoWorkersAvailable: uselessCreate,
 		})
+
+		count := uint32(0)
+		donecountc := make(chan struct{})
+		defer func() { close(donecountc) }()
+		go func() {
+			for {
+				select {
+				case <-donecountc:
+					return
+				case <-time.After(100 * time.Microsecond):
+				}
+				stats := pool.Stats()
+				nworkers := stats.ResidentWorkers
+				for {
+					prevcount := atomic.LoadUint32(&count)
+					if nworkers <= prevcount {
+						break
+					}
+					if atomic.CompareAndSwapUint32(&count, prevcount, nworkers) {
+						break
+					}
+				}
+			}
+		}()
+
 		pool.Submit(context.TODO(), func(context.Context) { time.Sleep(80 * time.Millisecond) })
 		donec := make(chan struct{})
 		go func() {
@@ -82,9 +128,13 @@ func TestWorkerPool_OptionWaitIfNoWorkersAvailable(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 			t.Fatalf("timed out")
 		case <-donec:
-			require.True(t, time.Since(now) >= 66*time.Millisecond)
+			require.True(t, time.Since(now) >= 60*time.Millisecond)
 		}
 		require.Nil(t, pool.WaitDone(context.TODO()))
+
+		if !uselessCreate {
+			require.Equal(t, capacity, atomic.LoadUint32(&count))
+		}
 	}
 
 	testF(1, func(pool *WorkerPool) {
@@ -101,6 +151,24 @@ func TestWorkerPool_OptionWaitIfNoWorkersAvailable(t *testing.T) {
 		f := func(context.Context) { time.Sleep(time.Millisecond) }
 		pool.SubmitConcurrentDependent(context.TODO(), f, f)
 	}, true)
+}
+
+func TestWorkerPool_OptionWaitIfNoWorkersAvailableWithIdleTimeout(t *testing.T) {
+	t.Parallel()
+
+	opts := Options{
+		Capacity:                 1,
+		IdleTimeout:              1 * time.Millisecond,
+		WaitIfNoWorkersAvailable: true,
+	}
+	p := New(opts)
+
+	for i := 0; i < 100; i++ {
+		err := p.Submit(context.TODO(), emptyFunc)
+		require.Nil(t, err)
+		time.Sleep(opts.IdleTimeout / time.Duration(i%2+1))
+	}
+	require.Nil(t, p.WaitDone(context.TODO()))
 }
 
 func TestWorkerPool_OptionCreateIfNoWorkersAvailable(t *testing.T) {
@@ -119,18 +187,25 @@ func TestWorkerPool_OptionCreateIfNoWorkersAvailable(t *testing.T) {
 			close(donec)
 		}()
 		select {
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(33 * time.Millisecond):
 			t.Fatalf("timed out")
 		case <-donec:
 		}
 		require.Nil(t, pool.WaitDone(context.TODO()))
 	}
 
+	f := func(context.Context) { time.Sleep(time.Millisecond) }
+	testF(1, func(pool *WorkerPool) {
+		pool.Submit(context.TODO(), f)
+		pool.Submit(context.TODO(), f)
+	})
 	testF(1, func(pool *WorkerPool) {
 		pool.Submit(context.TODO(), func(context.Context) { time.Sleep(time.Millisecond) })
 	})
+	testF(1, func(pool *WorkerPool) {
+		pool.SubmitConcurrentDependent(context.TODO(), f, f)
+	})
 	testF(2, func(pool *WorkerPool) {
-		f := func(context.Context) { time.Sleep(time.Millisecond) }
 		pool.SubmitConcurrentDependent(context.TODO(), f, f)
 	})
 }
@@ -173,7 +248,7 @@ func TestWorkerPool_Concurrent(t *testing.T) {
 		pool := New(opts)
 		wg := sync.WaitGroup{}
 		submitLoop := func() {
-			for i := 0; i < 100; i++ {
+			for i := 0; i < 333; i++ {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -289,4 +364,63 @@ func TestIDPool(t *testing.T) {
 			p.put(id)
 		}(id)
 	}
+}
+
+func TestCapacityNotifier(t *testing.T) {
+	t.Parallel()
+
+	n := capacityNotifier{}
+	{
+		n.incr()
+		n.decr()
+		for i := 0; i < 100; i++ {
+			select {
+			case <-n.availabled():
+				t.Fatal("should block forever")
+			default:
+			}
+		}
+	}
+	{
+		stopc := make(chan struct{})
+		(&n).enable(stopc, 1)
+		select {
+		case <-n.availabled():
+		case <-time.After(30 * time.Millisecond):
+			t.Fatal("should be available")
+		}
+		n.decr()
+		select {
+		case <-n.availabled():
+			t.Fatal("should be blocked")
+		case <-time.After(30 * time.Millisecond):
+		}
+		n.incr()
+		select {
+		case <-n.availabled():
+		case <-time.After(30 * time.Millisecond):
+			t.Fatal("should be available")
+		}
+		close(stopc)
+		n.decr()
+		n.decr()
+		n.incr()
+	}
+}
+
+func BenchmarkWorkerPool(b *testing.B) {
+	p := New(Options{
+		Capacity:                   20,
+		IdleTimeout:                5 * time.Minute,
+		CreateIfNoWorkersAvailable: true,
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = p.Submit(context.TODO(), func(context.Context) {
+		})
+	}
+	_ = p.WaitDone(context.TODO())
 }
