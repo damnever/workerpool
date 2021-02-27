@@ -23,6 +23,7 @@ test:  ## Run test cases. (Args: GOLANGCI_LINT_VERSION=latest)
 
 
 deps:  ## Update vendor.
+	go get -v ./...
 	go mod tidy -v
 	go mod verify
 
