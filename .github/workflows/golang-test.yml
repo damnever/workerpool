@@ -24,4 +24,8 @@ jobs:
           GOPROXY: "https://proxy.golang.org"
         run: go get -v -t -d ./...
       - name: Testing
-        run: go test -v -race ./...
+        run: go test -v -race -count=8 -coverprofile=coverage.out ./...
+      - name: Codecov
+        uses: codecov/codecov-action@v1.5.0
+        with:
+          files: ./coverage.out

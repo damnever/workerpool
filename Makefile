@@ -5,10 +5,10 @@ help:  ## Display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
 		/^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-GOLANGCI_LINT_VERSION ?= "latest"
+GOLANGCI_LINT_VERSION ?= "v1.32.2"
 
-test: SHELL:=/bin/bash
-test:  ## Run test cases. (Args: GOLANGCI_LINT_VERSION=latest)
+local-test: SHELL:=/bin/bash
+local-test:  ## Run test cases. (Args: GOLANGCI_LINT_VERSION=latest)
 	GOLANGCI_LINT_CMD=golangci-lint; \
 	_VERSION=$(GOLANGCI_LINT_VERSION); _VERSION=$${_VERSION#v}; \
 	if [[ ! -x $$(command -v golangci-lint) ]] || [[ "$${_VERSION}" != "latest" && $$(golangci-lint version 2>&1) != *"$${_VERSION}"* ]]; then \
@@ -18,7 +18,8 @@ test:  ## Run test cases. (Args: GOLANGCI_LINT_VERSION=latest)
 		GOLANGCI_LINT_CMD=./bin/golangci-lint; \
 	fi; \
 	$${GOLANGCI_LINT_CMD} run ./...
-	go test -v -race -coverprofile=coverage.out ./...
+	pushd /tmp && go get -u github.com/rakyll/gotest && popd
+	gotest -v -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out  # -o coverage.html
 
 
