@@ -46,6 +46,7 @@ func ExampleWorkerPool_locklessOperation() {
 			}
 			// The worker id starts with 1.
 			values[id-1] += n
+			time.Sleep(10 * time.Millisecond) // Too fast, sleep for a while..
 		})
 	}
 	_ = p.WaitDone(context.TODO())

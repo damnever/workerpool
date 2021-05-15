@@ -1,4 +1,4 @@
-// Package workerpool provides a flexible implementation of worker(goroutine) pool.
+// Package workerpool provides a handy and fast worker(goroutine) pool.
 //
 // It is extremely useful when we facing "morestack" issue.
 // Also some options can enable us to do lockless operations under some circumstances
@@ -8,6 +8,7 @@ package workerpool
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -27,10 +28,15 @@ type Options struct {
 	// Capacity specifies the maximum number of resident running workers(goroutines),
 	// 0 means no limit.
 	Capacity uint32
-	// IdleTimeout is the maximum amount of time an idle worker(goroutine) will
+	// IdleTimeout is the maximum amount of time a worker(goroutine) will
 	// remain idle before terminating itself. Zero means no limit, the workers
 	// never die if the pool is valid.
 	IdleTimeout time.Duration
+	// ResetInterval defines how often the worker(goroutine) must be restarted,
+	// zero to disable it.
+	// With this options enabled, a worker can reset its stack so that large stacks
+	// don't live in memory forever, 25% jitter will be applied.
+	ResetInterval time.Duration
 	// WaitIfNoWorkersAvailable will wait until there is a worker available
 	// if all resident workers are busy.
 	// It only works if the option Capacity greater than zero.
@@ -42,7 +48,7 @@ type Options struct {
 	// WaitIfNoWorkerAvailable is disabled.
 	CreateIfNoWorkersAvailable bool
 	// CreateWorkerID will inject a worker id into the context of Func.
-	// The worker id is useful, for example, we can use it to do some lockless operations
+	// It may be useful, for example, we can use it to do some lockless operations
 	// under some circumstances when we have fixed number of workers and those workers live long enough.
 	CreateWorkerID bool
 }
@@ -74,66 +80,61 @@ type Func func(context.Context)
 //
 // NOTE that the WorkerPool does not handle panics.
 type WorkerPool struct {
-	capacity                   uint32
+	capacity                   int
 	idleTimeout                time.Duration
+	resetInterval              time.Duration
 	waitIfNoWorkersAvailable   bool
 	createIfNoWorkersAvailable bool
 	idpool                     *idpool
-	workerCapacity             capacityNotifier
 
-	nworkers    uint32
 	nephemerals uint32
-	nidles      uint32
 	nwaiters    uint32
 
-	taskc   chan task
-	stopc   chan struct{}
-	stopped int32
-	wg      sync.WaitGroup
-	factory sync.Pool
-	fncpool sync.Pool
+	lock        sync.RWMutex
+	workers     workerList
+	idleWorkers workerQueue
+	waiters     waiterList
+	invalid     bool
+
+	rand       *rand.Rand
+	randlock   sync.Mutex
+	stopc      chan struct{}
+	wg         sync.WaitGroup
+	workerPool sync.Pool
+	waiterPool sync.Pool
+	funccPool  sync.Pool
 }
 
 // New creates a new WorkerPool.
 // The pool with default(empty) Options has infinite workers and the workers never die.
 func New(opts Options) *WorkerPool {
-	var idpool *idpool
-	if opts.CreateWorkerID {
-		idpool = newIDPool()
-	}
-	stopc := make(chan struct{})
-	workerCapacity := capacityNotifier{}
-	if opts.Capacity > 0 && opts.IdleTimeout > 0 && opts.WaitIfNoWorkersAvailable {
-		(&workerCapacity).enable(stopc, int(opts.Capacity))
-	}
-
-	return &WorkerPool{
-		capacity:                   opts.Capacity,
+	p := &WorkerPool{
+		capacity:                   int(opts.Capacity),
 		idleTimeout:                opts.IdleTimeout,
+		resetInterval:              opts.ResetInterval,
 		waitIfNoWorkersAvailable:   opts.WaitIfNoWorkersAvailable,
 		createIfNoWorkersAvailable: opts.CreateIfNoWorkersAvailable,
-		idpool:                     idpool,
-		workerCapacity:             workerCapacity,
+		idpool:                     newIDPool(opts.CreateWorkerID),
 
-		nworkers:    0,
 		nephemerals: 0,
-		nidles:      0,
+		lock:        sync.RWMutex{},
+		workers:     workerList{},
+		idleWorkers: workerQueue{},
+		waiters:     waiterList{},
+		invalid:     false,
 
-		taskc:   make(chan task),
-		stopc:   stopc,
-		stopped: 0,
-		wg:      sync.WaitGroup{},
-		factory: sync.Pool{
-			New: func() interface{} {
-				return &worker{}
-			},
-		},
-		fncpool: sync.Pool{
-			New: func() interface{} {
-				return make(chan Func)
-			},
-		},
+		rand:       rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec
+		randlock:   sync.Mutex{},
+		stopc:      make(chan struct{}),
+		wg:         sync.WaitGroup{},
+		workerPool: sync.Pool{},
+		waiterPool: sync.Pool{},
+		funccPool:  sync.Pool{},
 	}
+	if p.idleTimeout > 0 {
+		go p.workerGCLoop()
+	}
+	return p
 }
 
 // Stats contains a list of worker counters.
@@ -151,10 +152,14 @@ type Stats struct {
 
 // Stats returns the current stats.
 func (p *WorkerPool) Stats() Stats {
+	p.lock.RLock()
+	nworkers := p.workers.length()
+	nidles := p.idleWorkers.length()
+	p.lock.RUnlock()
 	return Stats{
-		ResidentWorkers:  atomic.LoadUint32(&p.nworkers),
+		ResidentWorkers:  uint32(nworkers),
 		EphemeralWorkers: atomic.LoadUint32(&p.nephemerals),
-		IdleWorkers:      atomic.LoadUint32(&p.nidles),
+		IdleWorkers:      uint32(nidles),
 		PendingSubmits:   atomic.LoadUint32(&p.nwaiters),
 	}
 }
@@ -162,14 +167,22 @@ func (p *WorkerPool) Stats() Stats {
 // WaitDone waits until all tasks done or the context done.
 // The pool becomes unusable(read only) after this operation.
 // If you want to wait multiple times, using an extra sync.WaitGroup.
+// NOTE it panics if ctx==nil, pass context.TODO() or context.Background() instead.
 func (p *WorkerPool) WaitDone(ctx context.Context) error {
-	if !atomic.CompareAndSwapInt32(&p.stopped, 0, 1) {
+	p.lock.Lock()
+	alreadyInvalid := p.invalid
+	if !alreadyInvalid {
+		p.invalid = true
+	}
+	p.lock.Unlock()
+	if alreadyInvalid {
 		return nil
 	}
 
 	close(p.stopc)
 	donec := make(chan struct{})
 	go func() {
+		p.stopAllWorkers()
 		p.wg.Wait()
 		close(donec)
 	}()
@@ -185,6 +198,7 @@ func (p *WorkerPool) WaitDone(ctx context.Context) error {
 // Submit submits a task and waits until it acquired by an available worker
 // or wait until the context done if WaitIfNoWorkersAvailable enabled.
 // The "same" ctx will be passed into Func.
+// NOTE it panics if ctx==nil, pass context.TODO() or context.Background() instead.
 func (p *WorkerPool) Submit(ctx context.Context, fn Func) error {
 	return p.submit(ctx, task{ctx: ctx, fn: fn})
 }
@@ -212,13 +226,14 @@ func (p *WorkerPool) SubmitConcurrentDependent(ctx context.Context, fns ...Func)
 			for _, future := range futures {
 				future.cancel()
 				if !settled { // Try to recycle the channels.
-					p.fncpool.Put(future.funcc)
+					p.funccPool.Put(future.funcc)
 				}
 			}
 		}
 	}()
 	for i := 0; i < n; i++ {
-		future := newFutureTaskFrom(p.fncpool.Get().(chan Func))
+		fnc, _ := p.funccPool.Get().(chan Func)
+		future := newFutureTaskFrom(fnc)
 		futures = append(futures, future)
 		if err = p.submit(ctx, task{ctx: ctx, future: future}); err != nil {
 			return err
@@ -239,188 +254,308 @@ func (p *WorkerPool) SubmitConcurrentDependent(ctx context.Context, fns ...Func)
 }
 
 // Extra per task options??
-func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:gocyclo
-	if atomic.LoadInt32(&p.stopped) == 1 {
-		return ErrInvalidWorkerPool
-	}
+func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:gocyclo,gocognit
 	atomic.AddUint32(&p.nwaiters, 1)
 	defer atomic.AddUint32(&p.nwaiters, ^uint32(0))
 
-	select {
-	case <-p.stopc:
+	wk, invalid := p.getIdleWorkerNoWait()
+	if invalid {
 		return ErrInvalidWorkerPool
-	case <-ctx.Done():
-		return ctx.Err()
-	case p.taskc <- task:
-		return nil
-	default:
+	}
+	if wk != nil {
+		select {
+		case <-p.stopc:
+			p.putIdleWorker(wk)
+			return ErrInvalidWorkerPool
+		case <-ctx.Done():
+			p.putIdleWorker(wk)
+			return ctx.Err()
+		case wk.taskc <- task:
+			return nil
+		}
 	}
 
 	for {
-		nworkers := atomic.LoadUint32(&p.nworkers)
-		if p.capacity == 0 || nworkers < p.capacity {
-			if !atomic.CompareAndSwapUint32(&p.nworkers, nworkers, nworkers+1) {
-				continue // Conflicted, try again.
-			}
-			// Make this job run first since we do not know
-			// when the goroutine will be scheduled and start running.
-			p.asyncWork(false, task)
+		// Make this job run first since we do not know
+		// when the goroutine will be scheduled and start running.
+		created, invalid := p.spawnWorker(false, task)
+		if invalid {
+			return ErrInvalidWorkerPool
+		}
+		if created {
 			return nil
 		}
 
 		if p.waitIfNoWorkersAvailable {
-			select {
-			case <-p.stopc:
+			var w *waiter
+			wk, w, invalid = p.getIdleWorkerOrWaiter()
+			if invalid {
 				return ErrInvalidWorkerPool
-			case <-ctx.Done():
-				return ctx.Err()
-			case p.taskc <- task:
-				return nil
-			case <-p.workerCapacity.availabled():
-				// Try to create a worker.
 			}
-		} else {
+			if wk == nil && w != nil {
+				select {
+				case <-p.stopc:
+					p.removeWaiter(w)
+					return ErrInvalidWorkerPool
+				case <-ctx.Done():
+					p.removeWaiter(w)
+					return ctx.Err()
+				case wk = <-w.C:
+					p.removeWaiter(w)
+					// We may use sync.Cond here, but the Wait is not cancelable.
+				}
+			}
+			if wk == nil {
+				// Nil value indicates that the pool is not full,
+				// we should try to create one.
+				continue
+			}
 			select {
 			case <-p.stopc:
+				p.putIdleWorker(wk)
 				return ErrInvalidWorkerPool
 			case <-ctx.Done():
+				p.putIdleWorker(wk)
 				return ctx.Err()
-			case p.taskc <- task:
+			case wk.taskc <- task:
 				return nil
-			default:
-				if p.createIfNoWorkersAvailable {
-					p.asyncWork(true, task)
-					return nil
-				}
-				return ErrNoWorkersAvaiable
 			}
 		}
+
+		if p.createIfNoWorkersAvailable {
+			if created, invalid := p.spawnWorker(true, task); !created || invalid {
+				panic("fail to spawn ephemeral worker")
+			}
+			return nil
+		}
+		return ErrNoWorkersAvaiable
 	}
 }
 
-func (p *WorkerPool) asyncWork(ephemeral bool, initTask task) {
-	p.wg.Add(1)
+func (p *WorkerPool) getIdleWorkerNoWait() (*worker, bool) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.invalid {
+		return nil, true
+	}
+	var wk *worker
+	if p.idleWorkers.length() > 0 {
+		wk = p.idleWorkers.get()
+	}
+	return wk, false
+}
+
+func (p *WorkerPool) getIdleWorkerOrWaiter() (*worker, *waiter, bool) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.invalid {
+		return nil, nil, true
+	}
+	if p.idleWorkers.length() > 0 {
+		wk := p.idleWorkers.get()
+		return wk, nil, false
+	}
+	if p.workers.length() < p.capacity {
+		return nil, nil, false
+	}
+
+	w, ok := p.waiterPool.Get().(*waiter)
+	if !ok {
+		w = newWaiter()
+	}
+	p.waiters.pushback(w)
+	return nil, w, false
+}
+
+func (p *WorkerPool) putIdleWorker(wk *worker) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.invalid {
+		return
+	}
+
+	p.idleWorkers.put(wk)
+
+	// Try notify waiters.
+	for p.idleWorkers.length() > 0 && p.waiters.length() > 0 {
+		w := p.waiters.popfront()
+		wk := p.idleWorkers.get()
+		w.C <- wk
+	}
+}
+
+func (p *WorkerPool) removeWaiter(w *waiter) {
+	p.lock.Lock()
+	p.waiters.remove(w)
+	p.lock.Unlock()
+
+	// We removed it from list so no one get chance to hold it
+	select {
+	case <-w.C: // Drain the channel so we can safely reuse it.
+	default:
+	}
+	p.waiterPool.Put(w)
+}
+
+func (p *WorkerPool) stopAllWorkers() {
+	p.lock.Lock()
+	if !p.invalid {
+		panic("WorkerPool still valid")
+	}
+	workers := p.workers.clear()
+	p.idleWorkers.clear()
+	p.waiters.clear()
+	p.lock.Unlock()
+
+	nworkers := len(workers)
+	if nworkers == 0 {
+		return
+	}
+	wg := sync.WaitGroup{}
+	maxprocs := runtime.GOMAXPROCS(-1)
+	split := (nworkers + maxprocs - 1) / maxprocs
+	for i := 0; i < maxprocs; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for k, n := i*split, (i+1)*split; k < n && k < nworkers; k++ {
+				workers[k].stop()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func (p *WorkerPool) workerGCLoop() {
+	// N.B we can let worker themselves to hanle timeouts,
+	// but those logic is too expensive for workers,
+	// huge number of workers with long-live select cases will consume
+	// a lot of CPU, so we should make worker as light as possible.
+	interval := p.idleTimeout
+	if interval >= 10*time.Second {
+		interval /= 2
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	const bufcap = 2048
+	workers := make([]*worker, 0, bufcap)
+	for {
+		select {
+		case <-p.stopc:
+			return
+		case <-ticker.C:
+		}
+
+		now := time.Now()
+		p.lock.Lock()
+		index := p.idleWorkers.binsearch(func(w *worker) bool { return !w.expired(now) })
+		p.idleWorkers.movebefore(index, &workers)
+		for _, w := range workers {
+			p.workers.remove(w) // Remove to avoid dead lock since taskc has no buffer.
+		}
+		p.lock.Unlock()
+
+		for _, w := range workers {
+			w.stop()
+		}
+		for i := range workers {
+			workers[i] = nil // Avoid memory leak.
+		}
+		workers = workers[:bufcap] // Keep a small bufffer only.
+	}
+}
+
+func (p *WorkerPool) spawnWorker(ephemeral bool, firstTask task) (bool, bool) {
+	newWorker := func() *worker {
+		wk, ok := p.workerPool.Get().(*worker)
+		if !ok {
+			wk = &worker{}
+		}
+		return wk
+	}
+
+	var wk *worker
+	if ephemeral {
+		wk = newWorker()
+	} else {
+		p.lock.Lock()
+		allow := p.capacity <= 0 || p.workers.length() < p.capacity
+		invalid := p.invalid
+		if invalid || !allow {
+			p.lock.Unlock()
+			return allow, invalid
+		}
+		wk = newWorker()
+		p.workers.pushback(wk)
+		p.lock.Unlock()
+	}
+	id := p.idpool.get()
+	wk.init(id, ephemeral)
+
 	if ephemeral {
 		atomic.AddUint32(&p.nephemerals, 1)
-	} else {
-		p.workerCapacity.decr()
 	}
-	atomic.AddUint32(&p.nidles, 1)
-
-	worker := p.makeWorker()
-	go func() {
-		defer func() {
-			p.recycleWorker(worker)
-			p.wg.Done()
-
-			if ephemeral {
-				atomic.AddUint32(&p.nephemerals, ^uint32(0))
-			} else {
-				if nworkers := atomic.AddUint32(&p.nworkers, ^uint32(0)); nworkers == ^uint32(0) {
-					panic("the counter of resident worker less than 0")
-				}
-				p.workerCapacity.incr()
-			}
-			atomic.AddUint32(&p.nidles, ^uint32(0))
-		}()
-
-		worker.run(&p.nidles, ephemeral, initTask)
-	}()
-}
-
-func (p *WorkerPool) makeWorker() *worker {
-	w := p.factory.Get().(*worker)
-	if p.idpool != nil {
-		w.id = p.idpool.get()
-	}
-	w.idleTimeout = p.idleTimeout
-	w.stopc = p.stopc
-	w.taskc = p.taskc
-	return w
-}
-
-func (p *WorkerPool) recycleWorker(w *worker) {
-	if p.idpool != nil {
-		p.idpool.put(w.id)
-	}
-	p.factory.Put(w)
-}
-
-type worker struct {
-	id          uint32
-	idleTimeout time.Duration
-	stopc       <-chan struct{}
-	taskc       <-chan task
-	timer       *time.Timer
-}
-
-func (w *worker) run(idleCounter *uint32, ephemeral bool, initTask task) {
-	timer := w.timer
-	defer func() {
-		if timer != nil {
-			// Try our best to make sure the timer is stopped and clean..
-			timer.Stop()
-			select {
-			case <-timer.C:
-			default:
-			}
-			// Set it.
-			w.timer = timer
-		}
-	}()
-
-	var (
-		timerc       <-chan time.Time
-		timerunknown = true
-		nexttask     = initTask
-	)
-	for {
-		atomic.AddUint32(idleCounter, ^uint32(0))
-		nexttask.execute(func(ctx context.Context) context.Context {
-			// Inject values into context.
-			if w.id != 0 {
-				ctx = injectWorkerID(ctx, w.id)
-			}
-			return ctx
-		})
-		atomic.AddUint32(idleCounter, 1)
-
+	p.wg.Add(1)
+	cleanupFunc := func() {
+		p.wg.Done()
 		if ephemeral {
-			return
-		}
-
-		if w.idleTimeout > 0 {
-			if timer == nil {
-				timer = time.NewTimer(w.idleTimeout)
-			} else {
-				// Careful, this piece of code may cause problems!!!
-				// We have not drained the t.C, so this is ok.
-				if !timerunknown && !timer.Stop() {
-					<-timer.C
-				}
-				timer.Reset(w.idleTimeout)
+			atomic.AddUint32(&p.nephemerals, ^uint32(0))
+		} else {
+			p.lock.Lock()
+			p.workers.remove(wk)
+			for remain := p.capacity - p.workers.length(); remain > 0 && p.waiters.length() > 0; remain-- {
+				w := p.waiters.popfront()
+				// Nil to signal waiters to try to create a worker.
+				w.C <- nil
 			}
-			timerunknown = false
-			timerc = timer.C
+			p.lock.Unlock()
 		}
 
-		select {
-		case <-w.stopc:
-			return
-		case <-timerc:
-			return
-		case nexttask = <-w.taskc:
-		}
+		p.idpool.put(id)
+		p.workerPool.Put(wk)
 	}
+	go wk.run(firstTask, ephemeral, cleanupFunc, p.putIdleWorker, p.idleTimeout, p.jitteredResetInterval())
+	return true, false
 }
+
+func (p *WorkerPool) jitteredResetInterval() time.Duration {
+	if p.resetInterval <= 0 {
+		return 0
+	}
+
+	p.randlock.Lock()
+	factor := p.rand.Float64()
+	p.randlock.Unlock()
+
+	f := float64(p.resetInterval)
+	delta := 0.25 * f
+	min := f - delta
+	max := f + delta
+	return time.Duration(min + (max-min)*factor)
+}
+
+var _emptytask = task{empty: true}
 
 type task struct {
+	empty bool
+
 	ctx    context.Context
 	fn     Func
 	future futureTask
 }
 
+func (t task) isempty() bool {
+	return t.empty
+}
+
 func (t task) execute(inject func(context.Context) context.Context) {
+	if t.isempty() {
+		return
+	}
+
 	if t.fn != nil {
 		t.fn(inject(t.ctx))
 	} else if fn, ok := t.future.resolve(); ok {
@@ -434,6 +569,9 @@ type futureTask struct {
 }
 
 func newFutureTaskFrom(fnc chan Func) futureTask {
+	if fnc == nil {
+		fnc = make(chan Func)
+	}
 	return futureTask{
 		cancelc: make(chan struct{}),
 		funcc:   fnc,
@@ -458,21 +596,381 @@ func (f futureTask) cancel() {
 	close(f.cancelc)
 }
 
+type worker struct {
+	id        uint32
+	taskc     chan task
+	expiredAt time.Time
+
+	prev *worker
+	next *worker
+	list *workerList
+}
+
+func (w *worker) init(id uint32, ephemeral bool) {
+	w.id = id
+	w.expiredAt = time.Time{}
+	if w.taskc == nil && !ephemeral {
+		w.taskc = make(chan task)
+	}
+}
+
+func (w *worker) expired(now time.Time) bool {
+	return !w.expiredAt.IsZero() && w.expiredAt.Before(now)
+}
+
+func (w *worker) stop() {
+	w.taskc <- _emptytask
+}
+
+func (w *worker) run(
+	nexttask task, ephemeral bool,
+	cleanup func(), markAsIdle func(*worker),
+	idleTimeout, resetInterval time.Duration,
+) {
+	// NOTE: can not use defer to do cleanup work since we may restart the goroutine.
+	startAt := time.Now()
+	for {
+		nexttask.execute(func(ctx context.Context) context.Context {
+			// Inject values into context.
+			if w.id != 0 {
+				ctx = injectWorkerID(ctx, w.id)
+			}
+			return ctx
+		})
+		nexttask = _emptytask // Avoid memory leak.
+
+		if ephemeral {
+			cleanup()
+			return // Terminating.
+		}
+
+		if resetInterval > 0 || idleTimeout > 0 { // Guard for less syscalls.
+			now := time.Now()
+			if resetInterval > 0 && startAt.Add(resetInterval).Before(now) {
+				// Restart the goroutine to reset the stack size.
+				go w.run(_emptytask, ephemeral, cleanup, markAsIdle, idleTimeout, resetInterval)
+				return
+			}
+			if idleTimeout > 0 {
+				w.expiredAt = now.Add(idleTimeout)
+			}
+		}
+
+		markAsIdle(w)
+		nexttask = <-w.taskc
+		if nexttask.isempty() {
+			cleanup()
+			return // Terminating.
+		}
+	}
+}
+
+// This queue implementation is copied and modified from:
+// https://github.com/eapache/queue/blob/master/queue.go
+type workerQueue struct {
+	workers []*worker
+	head    int
+	tail    int
+	count   int
+	cap     int
+}
+
+func (q *workerQueue) indexof(n int) int {
+	return n % q.cap
+}
+
+func (q *workerQueue) clear() {
+	*q = workerQueue{}
+}
+
+func (q *workerQueue) binsearch(f func(*worker) bool) int {
+	// Copied and modified from sort.Search.
+	i, j := 0, q.count
+	for i < j {
+		h := int(uint(i+j) >> 1) // avoid overflow when computing h.
+		// i ≤ h < j.
+		if !f(q.workers[q.indexof(h+q.head)]) {
+			i = h + 1 // preserves f(i-1) == false.
+		} else {
+			j = h // preserves f(j) == true.
+		}
+	}
+	// i == j, f(i-1) == false, and f(j) (= f(i)) == true  =>  answer is i.
+	return i
+}
+
+func (q *workerQueue) movebefore(idx int, buffer *[]*worker) {
+	*buffer = (*buffer)[:0]
+	if q.count == 0 || idx == 0 {
+		return
+	}
+
+	if q.head < q.tail {
+		max := q.head + idx
+		if max > q.tail {
+			max = q.tail
+		}
+		*buffer = append(*buffer, q.workers[q.head:max]...)
+	} else { // NOTE: if workers is full, tail == head.
+		max := q.head + idx
+		if max > q.cap {
+			max = q.cap
+		}
+		*buffer = append(*buffer, q.workers[q.head:max]...)
+		remain := idx - len(*buffer)
+		if remain > q.tail {
+			remain = q.tail
+		}
+		*buffer = append(*buffer, q.workers[0:remain]...)
+	}
+
+	n := len(*buffer)
+	for i := q.head; i < q.head+n; i++ {
+		q.workers[q.indexof(i)] = nil
+	}
+	q.head = q.indexof(q.head + n)
+	q.count -= n
+	q.tail = q.indexof(q.head + q.count)
+	q.tryresize()
+}
+
+func (q *workerQueue) put(w *worker) {
+	q.tryresize()
+
+	q.workers[q.tail] = w
+	q.tail = q.indexof(q.tail + 1)
+	q.count++
+}
+
+func (q *workerQueue) get() *worker {
+	if q.count == 0 {
+		panic("workerQueue: empty queue")
+	}
+	w := q.workers[q.head]
+	q.workers[q.head] = nil
+	q.head = q.indexof(q.head + 1)
+	q.count--
+
+	q.tryresize()
+	return w
+}
+
+func (q *workerQueue) length() int {
+	return q.count
+}
+
+func (q *workerQueue) tryresize() {
+	const highWatermark = 1024
+	const lowWatermark = 16
+	needresize := false
+	if q.count == q.cap {
+		if q.cap == 0 {
+			q.cap = 1
+		}
+		if bufcap := (q.cap << 1); bufcap <= highWatermark {
+			q.cap = bufcap
+		} else {
+			q.cap += highWatermark
+		}
+		needresize = true
+	} else if q.cap > lowWatermark && (q.count<<2) == q.cap {
+		q.cap >>= 1
+		needresize = true
+	}
+	if !needresize {
+		return
+	}
+
+	workers := make([]*worker, q.cap, q.cap)
+	if q.head < q.tail {
+		copy(workers, q.workers[q.head:q.tail])
+	} else { // NOTE: if workers is full, tail == head.
+		n := copy(workers, q.workers[q.head:])
+		copy(workers[n:], q.workers[:q.tail])
+	}
+	q.workers = workers
+	q.head = 0
+	q.tail = q.count
+}
+
+type workerList struct {
+	// A dummy node has the next points to the head of the list,
+	// the preve points to the tail of the list.
+	dummy worker
+	count int
+}
+
+func (l *workerList) lazyinit() {
+	if l.dummy.next == nil {
+		l.dummy.next = &l.dummy
+		l.dummy.prev = &l.dummy
+		l.count = 0
+	}
+}
+
+func (l *workerList) length() int {
+	return l.count
+}
+
+func (l *workerList) clear() []*worker {
+	if l.count == 0 {
+		return nil
+	}
+
+	workers := make([]*worker, 0, l.count)
+	for e := l.dummy.next; e.list != nil && e != &l.dummy; {
+		workers = append(workers, e)
+		pe := e
+		e = e.next
+		l.remove(pe)
+	}
+	return workers
+}
+
+func (l *workerList) popfront() *worker {
+	if l.count == 0 {
+		panic("workerList: empty")
+	}
+	e := l.dummy.next
+	l.remove(e)
+	return e
+}
+
+func (l *workerList) pushback(e *worker) {
+	l.lazyinit()
+	if e.list != nil {
+		panic("workerList: insert duplicate element")
+	}
+
+	tail := l.dummy.prev
+	e.prev = tail
+	e.next = tail.next
+	e.prev.next = e
+	e.next.prev = e
+	e.list = l
+	l.count++
+}
+
+func (l *workerList) remove(e *worker) bool { //nolint:unparam
+	if l != e.list {
+		return false
+	}
+	e.prev.next = e.next
+	e.next.prev = e.prev
+	e.prev = nil
+	e.next = nil
+	e.list = nil
+	l.count--
+	if l.count < 0 {
+		panic("workerList: negative count")
+	}
+	return true
+}
+
+type waiter struct {
+	C chan *worker
+
+	list *waiterList
+	prev *waiter
+	next *waiter
+}
+
+func newWaiter() *waiter {
+	return &waiter{
+		C: make(chan *worker, 1), // Buffer needed.
+	}
+}
+
+type waiterList struct {
+	// A dummy node has the next points to the head of the list,
+	// the preve points to the tail of the list.
+	dummy waiter
+	count int
+}
+
+func (l *waiterList) lazyinit() {
+	if l.dummy.next == nil {
+		l.dummy.next = &l.dummy
+		l.dummy.prev = &l.dummy
+		l.count = 0
+	}
+}
+
+func (l *waiterList) clear() {
+	if l.count == 0 {
+		return
+	}
+	for e := l.dummy.next; e.list != nil && e != &l.dummy; {
+		pe := e
+		e = e.next
+		l.remove(pe)
+	}
+}
+
+func (l *waiterList) length() int {
+	return l.count
+}
+
+func (l *waiterList) popfront() *waiter {
+	if l.count == 0 {
+		panic("waiterList: empty")
+	}
+	e := l.dummy.next
+	l.remove(e)
+	return e
+}
+
+func (l *waiterList) pushback(e *waiter) {
+	l.lazyinit()
+	if e.list != nil {
+		panic("waiterList: insert duplicate element")
+	}
+
+	tail := l.dummy.prev
+	e.prev = tail
+	e.next = tail.next
+	e.prev.next = e
+	e.next.prev = e
+	e.list = l
+	l.count++
+}
+
+func (l *waiterList) remove(e *waiter) bool { //nolint:unparam
+	if l != e.list {
+		return false
+	}
+	e.prev.next = e.next
+	e.next.prev = e.prev
+	e.prev = nil
+	e.next = nil
+	e.list = nil
+	l.count--
+	if l.count < 0 {
+		panic("waiterList: negative count")
+	}
+	return true
+}
+
 type idpool struct {
 	lock     sync.Mutex
 	recycled map[uint32]bool
 	next     uint32
+	enabled  bool
 }
 
-func newIDPool() *idpool {
+func newIDPool(enable bool) *idpool {
 	return &idpool{
-		lock:     sync.Mutex{},
 		recycled: make(map[uint32]bool),
 		next:     1,
+		enabled:  enable,
 	}
 }
 
 func (p *idpool) get() uint32 {
+	if !p.enabled {
+		return 0
+	}
+
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -487,6 +985,10 @@ func (p *idpool) get() uint32 {
 }
 
 func (p *idpool) put(id uint32) {
+	if !p.enabled {
+		return
+	}
+
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -498,75 +1000,4 @@ func (p *idpool) put(id uint32) {
 	} else {
 		p.recycled[id] = true
 	}
-}
-
-type capacityNotifier struct {
-	enabled bool
-
-	countc  chan int
-	notifyc chan struct{}
-	stopc   <-chan struct{}
-}
-
-func (n *capacityNotifier) enable(stopc <-chan struct{}, capacity int) {
-	if n.enabled {
-		panic("enabled")
-	}
-	n.enabled = true
-	n.countc = make(chan int)
-	n.notifyc = make(chan struct{})
-	n.stopc = stopc
-	go n.countAndNotifyLoop(capacity)
-}
-
-func (n capacityNotifier) countAndNotifyLoop(max int) {
-	remain := max
-	notifyc := n.notifyc //nolint:ineffassign,staticcheck
-	for {
-		if remain > max || remain < 0 {
-			panic(fmt.Sprintf("invalid %d not in [0, %d]", remain, max))
-		}
-		if remain == 0 {
-			notifyc = nil
-		} else {
-			notifyc = n.notifyc
-		}
-
-		select {
-		case <-n.stopc:
-			return
-		case v := <-n.countc:
-			remain += v
-		case notifyc <- struct{}{}:
-			// Sleep here??
-			runtime.Gosched()
-		}
-	}
-}
-
-func (n capacityNotifier) incr() {
-	if !n.enabled {
-		return
-	}
-	select {
-	case <-n.stopc:
-	case n.countc <- 1:
-	}
-}
-
-func (n capacityNotifier) decr() {
-	if !n.enabled {
-		return
-	}
-	select {
-	case <-n.stopc:
-	case n.countc <- -1:
-	}
-}
-
-func (n capacityNotifier) availabled() <-chan struct{} {
-	if !n.enabled {
-		return nil
-	}
-	return n.notifyc
 }
