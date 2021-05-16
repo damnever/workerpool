@@ -265,9 +265,11 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 	if wk != nil {
 		select {
 		case <-p.stopc:
-			p.putIdleWorker(wk)
 			return ErrInvalidWorkerPool
 		case <-ctx.Done():
+			// N.B. putIdleWorker will update worker's idle state (delay the idleTimeout),
+			// but this is ok because if pool is busy, recreating a worker is wastful,
+			// if pool is idle, delay is acceptable.
 			p.putIdleWorker(wk)
 			return ctx.Err()
 		case wk.taskc <- task:
@@ -312,7 +314,6 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 			}
 			select {
 			case <-p.stopc:
-				p.putIdleWorker(wk)
 				return ErrInvalidWorkerPool
 			case <-ctx.Done():
 				p.putIdleWorker(wk)
@@ -376,6 +377,7 @@ func (p *WorkerPool) putIdleWorker(wk *worker) {
 		return
 	}
 
+	wk.resetIdleState(p.idleTimeout)
 	p.idleWorkers.put(wk)
 
 	// Try notify waiters.
@@ -429,7 +431,7 @@ func (p *WorkerPool) stopAllWorkers() {
 }
 
 func (p *WorkerPool) workerGCLoop() {
-	// N.B we can let worker themselves to hanle timeouts,
+	// N.B. we can let worker themselves to hanle timeouts,
 	// but those logic is too expensive for workers,
 	// huge number of workers with long-live select cases will consume
 	// a lot of CPU, so we should make worker as light as possible.
@@ -517,7 +519,7 @@ func (p *WorkerPool) spawnWorker(ephemeral bool, firstTask task) (bool, bool) {
 		p.idpool.put(id)
 		p.workerPool.Put(wk)
 	}
-	go wk.run(firstTask, ephemeral, cleanupFunc, p.putIdleWorker, p.idleTimeout, p.jitteredResetInterval())
+	go wk.run(firstTask, cleanupFunc, p.putIdleWorker, p.jitteredResetInterval())
 	return true, false
 }
 
@@ -598,6 +600,7 @@ func (f futureTask) cancel() {
 
 type worker struct {
 	id        uint32
+	ephemeral bool
 	taskc     chan task
 	expiredAt time.Time
 
@@ -608,9 +611,16 @@ type worker struct {
 
 func (w *worker) init(id uint32, ephemeral bool) {
 	w.id = id
+	w.ephemeral = ephemeral
 	w.expiredAt = time.Time{}
 	if w.taskc == nil && !ephemeral {
 		w.taskc = make(chan task)
+	}
+}
+
+func (w *worker) resetIdleState(idleTimeout time.Duration) {
+	if idleTimeout > 0 {
+		w.expiredAt = time.Now().Add(idleTimeout)
 	}
 }
 
@@ -622,11 +632,7 @@ func (w *worker) stop() {
 	w.taskc <- _emptytask
 }
 
-func (w *worker) run(
-	nexttask task, ephemeral bool,
-	cleanup func(), markAsIdle func(*worker),
-	idleTimeout, resetInterval time.Duration,
-) {
+func (w *worker) run(nexttask task, cleanup func(), markAsIdle func(*worker), resetInterval time.Duration) {
 	// NOTE: can not use defer to do cleanup work since we may restart the goroutine.
 	startAt := time.Now()
 	for {
@@ -639,20 +645,16 @@ func (w *worker) run(
 		})
 		nexttask = _emptytask // Avoid memory leak.
 
-		if ephemeral {
+		if w.ephemeral {
 			cleanup()
 			return // Terminating.
 		}
 
-		if resetInterval > 0 || idleTimeout > 0 { // Guard for less syscalls.
-			now := time.Now()
-			if resetInterval > 0 && startAt.Add(resetInterval).Before(now) {
+		if resetInterval > 0 { // Guard for less syscalls.
+			if time.Since(startAt) >= resetInterval {
 				// Restart the goroutine to reset the stack size.
-				go w.run(_emptytask, ephemeral, cleanup, markAsIdle, idleTimeout, resetInterval)
+				go w.run(_emptytask, cleanup, markAsIdle, resetInterval)
 				return
-			}
-			if idleTimeout > 0 {
-				w.expiredAt = now.Add(idleTimeout)
 			}
 		}
 
