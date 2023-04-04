@@ -72,7 +72,7 @@ func WorkerID(ctx context.Context) (uint32, bool) {
 	return 0, false
 }
 
-// Func is the type of the function called by worker in the pool.
+// Func is the type of function called by worker in the pool.
 // It is the caller's responsibility to recover the panic.
 type Func func(context.Context)
 
@@ -255,6 +255,12 @@ func (p *WorkerPool) SubmitConcurrentDependent(ctx context.Context, fns ...Func)
 
 // Extra per task options??
 func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:gocyclo,gocognit
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	atomic.AddUint32(&p.nwaiters, 1)
 	defer atomic.AddUint32(&p.nwaiters, ^uint32(0))
 

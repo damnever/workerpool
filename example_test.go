@@ -66,3 +66,27 @@ func ExampleWorkerPool_locklessOperation() {
 	// 8
 	// 5050
 }
+
+func ExampleWrap() {
+	p := New(Options{
+		Capacity:                 8,
+		WaitIfNoWorkersAvailable: true,
+	})
+
+	increase := func(a int) int {
+		return a + 1
+	}
+	wrappedIncrease := Wrap(p, func(_ context.Context, i int) (int, error) {
+		return increase(i), nil
+	})
+
+	count := 0
+	for i := 0; i < 100; i++ {
+		count, _ = wrappedIncrease(context.TODO(), count)
+	}
+	_ = p.WaitDone(context.TODO())
+	fmt.Println(count)
+
+	// Output:
+	// 100
+}
