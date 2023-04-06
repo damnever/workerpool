@@ -5,20 +5,17 @@ import (
 	"sync"
 )
 
-// ParameterizedFunc is the type of function with input and output parameters.
-type ParameterizedFunc[In, Out any] func(context.Context, In) (Out, error)
-
-// NoParameter is a placeholder for convinience.
-type NoParameter struct{}
+// None is a placeholder for convinience if there is no parameters or no return value.
+type None struct{}
 
 type wrapResult[T any] struct {
-	out T
+	val T
 	err error
 }
 
 // Wrap wraps a function for ease of future use,
 // allowing the wrapped function to be executed within the WorkerPool.
-func Wrap[In, Out any](p *WorkerPool, f ParameterizedFunc[In, Out]) ParameterizedFunc[In, Out] {
+func Wrap[In, Out any](p *WorkerPool, f func(context.Context, In) (Out, error)) func(context.Context, In) (Out, error) {
 	chanPool := sync.Pool{}
 
 	return func(ctx context.Context, in In) (Out, error) {
@@ -29,7 +26,7 @@ func Wrap[In, Out any](p *WorkerPool, f ParameterizedFunc[In, Out]) Parameterize
 
 		err := p.Submit(ctx, func(innerctx context.Context) {
 			out, err := f(innerctx, in)
-			c <- wrapResult[Out]{out: out, err: err}
+			c <- wrapResult[Out]{val: out, err: err}
 		})
 		if err != nil {
 			chanPool.Put(c)
@@ -38,6 +35,6 @@ func Wrap[In, Out any](p *WorkerPool, f ParameterizedFunc[In, Out]) Parameterize
 		}
 		ret := <-c
 		chanPool.Put(c)
-		return ret.out, ret.err
+		return ret.val, ret.err
 	}
 }
