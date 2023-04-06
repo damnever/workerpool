@@ -23,7 +23,7 @@ var (
 	ErrInvalidWorkerPool = fmt.Errorf("workerpool: invalid worker pool")
 )
 
-// Options configurates the WorkerPool.
+// Options configure the WorkerPool.
 type Options struct {
 	// Capacity specifies the maximum number of resident running workers(goroutines),
 	// 0 means no limit.

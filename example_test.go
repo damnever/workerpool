@@ -67,8 +67,37 @@ func ExampleWorkerPool_locklessOperation() {
 	// 5050
 }
 
+func ExamplePipeline() {
+	pool := New(Options{
+		Capacity:                 4,
+		WaitIfNoWorkersAvailable: true,
+	})
+
+	pipeline := NewPipelineWith[int, int](PipelineOptions{
+		FeederAsyncExecutor: GoSpawn,
+		WorkerAsyncExecutor: pool.Submit,
+	})
+	inputs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	_ = pipeline.StartFeeder(context.Background(), inputs)
+	_ = pipeline.StartWorkerN(context.Background(), 4, func(_ context.Context, i int) int {
+		return i * 2
+	})
+
+	sum := 0
+	for v := range pipeline.Join() {
+		sum += v
+	}
+	fmt.Println("zero canceled:", len(inputs) == pipeline.ProcessedCount())
+	fmt.Println("sum:", sum)
+	_ = pool.WaitDone(context.TODO()) // Clean up.
+
+	// Output:
+	// zero canceled: true
+	// sum: 272
+}
+
 func ExampleWrap() {
-	p := New(Options{
+	pool := New(Options{
 		Capacity:                 8,
 		WaitIfNoWorkersAvailable: true,
 	})
@@ -76,7 +105,7 @@ func ExampleWrap() {
 	increase := func(a int) int {
 		return a + 1
 	}
-	wrappedIncrease := Wrap(p, func(_ context.Context, i int) (int, error) {
+	wrappedIncrease := Wrap(pool, func(_ context.Context, i int) (int, error) {
 		return increase(i), nil
 	})
 
@@ -84,7 +113,7 @@ func ExampleWrap() {
 	for i := 0; i < 100; i++ {
 		count, _ = wrappedIncrease(context.TODO(), count)
 	}
-	_ = p.WaitDone(context.TODO())
+	_ = pool.WaitDone(context.TODO())
 	fmt.Println(count)
 
 	// Output:
