@@ -10,7 +10,7 @@ import (
 var (
 	// ErrPipelineFrozen means the pipeline does not accept any further operations
 	// since Pipeline.Join has been called.
-	ErrPipelineFrozen = fmt.Errorf("workerpool: pipeline is frozed")
+	ErrPipelineFrozen = fmt.Errorf("workerpool: pipeline is frozen")
 )
 
 // AsyncExecutor is a function type used for executing a function asynchronously.
