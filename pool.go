@@ -1,8 +1,3 @@
-// Package workerpool provides a handy and fast worker(goroutine) pool.
-//
-// It is extremely useful when we facing "morestack" issue.
-// Also some options can enable us to do lockless operations under some circumstances
-// by using the worker id.
 package workerpool
 
 import (
@@ -77,8 +72,11 @@ func WorkerID(ctx context.Context) (uint32, bool) {
 type Func func(context.Context)
 
 // WorkerPool offers a pool of reusable workers(goroutines).
-//
 // NOTE that the WorkerPool does not handle panics.
+//
+// It is extremely useful when we are facing the "morestack" issue.
+// Additionally, certain options can enable us to perform lockless operations
+// under specific circumstances by utilizing the worker ID.
 type WorkerPool struct {
 	capacity                   int
 	idleTimeout                time.Duration
