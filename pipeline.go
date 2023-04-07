@@ -24,6 +24,12 @@ func GoSpawn(ctx context.Context, fn Func) error {
 }
 
 // PipelineOptions configure the Pipeline.
+//
+// NOTE that if you enable the WaitIfNoWorkersAvailable option
+// with a small Capacity and BufferSize while using the WorkerPool
+// for both Feeder and Worker, it may result in a deadlock.
+// Additionally, chaining multiple Pipelines under such circumstances
+// may also cause a deadlock.
 type PipelineOptions struct {
 	// FeederAsyncExecutor is the AsyncExecutor used by feeder.
 	FeederAsyncExecutor AsyncExecutor
@@ -56,7 +62,7 @@ func NewPipeline[In, Out any]() *Pipeline[In, Out] {
 	})
 }
 
-// NewPipelineWith creates a new Pipeline with options.
+// NewPipelineWith creates a new Pipeline with PipelineOptions.
 func NewPipelineWith[In, Out any](opts PipelineOptions) *Pipeline[In, Out] {
 	if opts.FeederAsyncExecutor == nil {
 		opts.FeederAsyncExecutor = GoSpawn
