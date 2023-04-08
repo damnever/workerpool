@@ -27,17 +27,17 @@ func TestPipeline_AsyncExecutor(t *testing.T) {
 		WorkerAsyncExecutor: workerExecutor,
 	})
 
-	_ = pipeline.StartFeeder(context.Background(), []int{1, 2})
-	_ = pipeline.StartFeeder(context.Background(), []int{3, 4})
-	_ = pipeline.StartWorker(context.Background(), func(_ context.Context, i int) int {
+	require.NoError(t, pipeline.StartFeeder(context.Background(), []int{1, 2}))
+	require.NoError(t, pipeline.StartFeeder(context.Background(), []int{3, 4}))
+	require.NoError(t, pipeline.StartWorker(context.Background(), func(_ context.Context, i int) int {
 		return i * 2
-	})
-	_ = pipeline.StartWorker(context.Background(), func(_ context.Context, i int) int {
+	}))
+	require.NoError(t, pipeline.StartWorker(context.Background(), func(_ context.Context, i int) int {
 		return i * 2
-	})
-	_ = pipeline.StartWorkerN(context.Background(), 2, func(_ context.Context, i int) int {
+	}))
+	require.NoError(t, pipeline.StartWorkerN(context.Background(), 2, func(_ context.Context, i int) int {
 		return i * 2
-	})
+	}))
 
 	require.Equal(t, int32(2), feederCount.Load())
 	require.Equal(t, int32(4), workerCount.Load())
