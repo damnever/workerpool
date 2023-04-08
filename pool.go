@@ -11,9 +11,9 @@ import (
 )
 
 var (
-	// ErrNoWorkersAvaiable is returned if there is no workers available
+	// ErrNoWorkersAvailable is returned if there is no workers available
 	// in condition of both WaitIfNoWorkersAvailable and CreateIfNoWorkersAvailable are disabled.
-	ErrNoWorkersAvaiable = fmt.Errorf("workerpool: not workers available")
+	ErrNoWorkersAvailable = fmt.Errorf("workerpool: not workers available")
 	// ErrInvalidWorkerPool indicates WaitDone function has been called.
 	ErrInvalidWorkerPool = fmt.Errorf("workerpool: invalid worker pool")
 )
@@ -333,7 +333,7 @@ func (p *WorkerPool) submit(ctx context.Context, task task) error { //nolint:goc
 			}
 			return nil
 		}
-		return ErrNoWorkersAvaiable
+		return ErrNoWorkersAvailable
 	}
 }
 

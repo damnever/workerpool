@@ -24,7 +24,7 @@ func TestWorkerPool_OptionCapacity(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		require.Nil(t, pool.Submit(ctx, func(context.Context) { time.Sleep(100 * time.Millisecond) }))
-		require.Equal(t, ErrNoWorkersAvaiable, pool.Submit(ctx, emptyFunc))
+		require.Equal(t, ErrNoWorkersAvailable, pool.Submit(ctx, emptyFunc))
 		require.Nil(t, pool.WaitDone(context.TODO()))
 	}
 	{
@@ -32,7 +32,7 @@ func TestWorkerPool_OptionCapacity(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		require.Nil(t, pool.SubmitConcurrentDependent(ctx, f, f))
-		require.Equal(t, ErrNoWorkersAvaiable, pool.SubmitConcurrentDependent(ctx, emptyFunc))
+		require.Equal(t, ErrNoWorkersAvailable, pool.SubmitConcurrentDependent(ctx, emptyFunc))
 		require.Nil(t, pool.WaitDone(context.TODO()))
 	}
 	{
@@ -40,7 +40,7 @@ func TestWorkerPool_OptionCapacity(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		require.Nil(t, pool.SubmitConcurrentDependent(ctx, emptyFunc))
-		require.Equal(t, ErrNoWorkersAvaiable, pool.SubmitConcurrentDependent(ctx, f, f))
+		require.Equal(t, ErrNoWorkersAvailable, pool.SubmitConcurrentDependent(ctx, f, f))
 		require.Nil(t, pool.WaitDone(context.TODO()))
 	}
 }
